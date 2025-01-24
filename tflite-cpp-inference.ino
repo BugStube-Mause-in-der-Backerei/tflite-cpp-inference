@@ -6,7 +6,57 @@
 #include <U8g2lib.h>
 #include <vector>
 
-// include main library header file
+U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI u8g2(U8G2_R0, 2, 3, U8X8_PIN_NONE, 0, 1);
+
+//#define DEBUG
+
+#ifdef DEBUG
+#define DEBUG_PRINT(x) Serial.print(x)
+#define DEBUG_PRINTF(x, y) Serial.print(x, y)
+#define DEBUG_PRINTLN(x) Serial.println(x)
+#else
+#define DEBUG_PRINT(x)
+#define DEBUG_PRINTF(x, y)
+#define DEBUG_PRINTLN(x)
+#endif
+
+// Allowed deviation (in degrees) relative to target angle
+#define DEVIATION_THRESHOLD 3
+
+OPT3101 sensor;
+Buzzer buzzer;
+ButtonA buttonA;
+ButtonB buttonB;
+ButtonC buttonC;
+LineSensors lineSensors;
+BumpSensors bumpSensors;
+Motors motors;
+Encoders encoders;
+RGBLEDs leds;
+IMU imu;
+
+#include "TurnSensor.h"
+
+const int WHEEL_CIRCUMFERENZCE = 10.0531;
+const int CLICKS_PER_ROTATION = 12;
+const float GEAR_RATIO = 29.86F;
+bool wallLeft = true;
+bool wallRight = false;
+bool startingWall = false;
+long countsRight = 0;
+long prevRight = 0;
+float distanceRight = 0.0F;
+int headingDirection = 0;
+int defaultSpeed = 80;
+float currentPos[] = { 0.5, 0.5 };
+float endPos[] = { 10.5, 4.5 };
+String endProgramm = "";
+
+// method call to be able to define default parameters
+bool moveForward(bool forward = true, int count = 1);
+void turn(char dir, int count = 1);
+
+// TF-Lite stuff
 #include <Chirale_TensorFlowLite.h>
 
 // include static array definition of pre-trained model
@@ -26,14 +76,26 @@ tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
 
-float my_x = 0.5;
-float my_y = 0.5;
-
-float goal_x = 9.5;
-float goal_y = 9.5;
+float current_distance = 0.0f;
 
 int action = 0;
 float action_max = 0.0f;
+int seed = 4;
+
+float epsilon = 0.28f;
+
+enum actions {
+  LEFT = 0,
+  RIGHT = 1,
+  MOVE = 2,
+};
+
+enum Direction {
+  NORTH = 0,
+  EAST = 270,
+  SOUTH = 180,
+  WEST = 90
+};
 
 bool driving = false;
 
@@ -48,38 +110,6 @@ constexpr int kTensorArenaSize = 3 * 1024;
 // should be stored in memory at an address that is a multiple of 16.
 alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 
-OPT3101 sensor;
-Motors motors;
-ButtonA buttonA;
-BumpSensors bumpSensors;
-Buzzer buzzer;
-Encoders encoders;
-// OLED display;
-LineSensors lineSensors;
-RGBLEDs leds;
-IMU imu;
-
-U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI u8g2(U8G2_R0, 2, /*data*/ 3, /* cs=*/U8X8_PIN_NONE, /* dc=*/0, /* reset=*/1);
-
-// Allowed deviation (in degrees) relative to target angle
-#define DEVIATION_THRESHOLD 3
-
-#include "TurnSensor.h"
-
-long countsRight = 0;
-long prevRight = 0;
-const int CLICKS_PER_ROTATION = 12;
-const float GEAR_RATIO = 29.86F;
-const int WHEEL_CIRCUMFERENCE = 10.0531;
-float Sr = 0.0F;
-int headingDirection = 0;
-bool wallLeft = true;
-bool wallRight = true;
-int defaultSpeed = 80;
-
-// method call to be able to define default parameters
-void moveForward(bool forward = true, int count = 1);
-void turn(char dir, int count = 1);
 
 void setup() {
   // Initialize serial communications and wait for Serial Monitor to be opened
@@ -88,8 +118,22 @@ void setup() {
   u8g2.setFont(u8g2_font_ncenB14_tr);
   Wire.begin();
   delay(1000);
-  
-  Serial.println("Initializing TensorFlow Lite Micro Interpreter...");
+
+  turnSensorSetup();
+  turnSensorReset();
+
+  sensor.init();
+  if (sensor.getLastError()) {
+    DEBUG_PRINT(F("Failed to initialize OPT3101: error "));
+    DEBUG_PRINTLN(sensor.getLastError());
+  }
+  sensor.setFrameTiming(512);
+  sensor.setBrightness(OPT3101Brightness::Adaptive);
+
+  encoders.getCountsAndResetLeft();
+  encoders.getCountsAndResetRight();
+
+  DEBUG_PRINTLN("Initializing TensorFlow Lite Micro Interpreter...");
 
   // Map the model into a usable data structure. This doesn't involve any
   // copying or parsing, it's a very lightweight operation.
@@ -99,7 +143,7 @@ void setup() {
   // if not, there is a misalignement between TensorFlow version used
   // to train and generate the TFLite model and the current version of library
   if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("Model provided and schema version are not equal!");
+    DEBUG_PRINTLN("Model provided and schema version are not equal!");
     while (true)
       ;  // stop program here
   }
@@ -125,101 +169,126 @@ void setup() {
   input = interpreter->input(0);
   output = interpreter->output(0);
 
-  turnSensorSetup();
-  turnSensorReset();
+#ifdef DEBUG
+  // Ensure the input and output tensors have the correct shapes
+  DEBUG_PRINT("nullptr != input: ");
+  DEBUG_PRINTLN(nullptr != input ? "True" : "False");
+  DEBUG_PRINT("2 == input->dims->size: ");
+  DEBUG_PRINTLN(2 == input->dims->size ? "True" : "False");
+  DEBUG_PRINT("1 == input->dims->data[0]: ");
+  DEBUG_PRINTLN(1 == input->dims->data[0] ? "True" : "False");
+  DEBUG_PRINT("7 == input->dims->data[1]: ");
+  DEBUG_PRINTLN(7 == input->dims->data[1] ? "True" : "False");
+  DEBUG_PRINT("kTfLiteFloat32 == input->type: ");
+  DEBUG_PRINTLN(kTfLiteFloat32 == input->type ? "True" : "False");
 
-  sensor.init();
-  if (sensor.getLastError()) {
-    Serial.print(F("Failed to initialize OPT3101: error "));
-    Serial.println(sensor.getLastError());
-  }
-  sensor.setFrameTiming(512);
-  sensor.setBrightness(OPT3101Brightness::Adaptive);
+  DEBUG_PRINT("nullptr != output: ");
+  DEBUG_PRINTLN(nullptr != output ? "True" : "False");
+  DEBUG_PRINT("2 == output->dims->size: ");
+  DEBUG_PRINTLN(2 == output->dims->size ? "True" : "False");
+  DEBUG_PRINT("1 == output->dims->data[0]: ");
+  DEBUG_PRINTLN(1 == output->dims->data[0] ? "True" : "False");
+  DEBUG_PRINT("3 == output->dims->data[1]: ");
+  DEBUG_PRINTLN(3 == output->dims->data[1] ? "True" : "False");
+  DEBUG_PRINT("kTfLiteFloat32 == output->type: ");
+  DEBUG_PRINTLN(kTfLiteFloat32 == output->type ? "True" : "False");
+#endif
 
-  encoders.getCountsAndResetLeft();
-  encoders.getCountsAndResetRight();
+  buzzer.play("C32");
 
-  //buzzer.play("C32");
-
-  Serial.println("Initialization done.");
-  Serial.println("");
+  DEBUG_PRINTLN("Initialization done.");
+  DEBUG_PRINTLN("");
 }
 
 
 void loop() {
   motors.setSpeeds(0, 0);
-  bumpSensors.read();
+  bumpSensors.calibrate();
   if (buttonA.isPressed()) {
     delay(2000);
     driving = !driving;
   }
   if (driving) {
+    u8g2.firstPage();
+    u8g2.setCursor(0, 40);
+    u8g2.print("x: ");
+    u8g2.print(currentPos[0]);
+    u8g2.print(", ");
+    u8g2.print("y: ");
+    u8g2.print(currentPos[1]);
+    u8g2.nextPage();
+    if (buttonB.isPressed()) {
+      driving = !driving;
+    }
 
-    delay(1000);
 
-    input->data.f[0] = my_x;
-    input->data.f[1] = my_y;
 
-    input->data.f[2] = goal_x;
-    input->data.f[3] = goal_y;
+    input->data.f[0] = currentPos[0];
+    input->data.f[1] = currentPos[1];
+
+    input->data.f[2] = endPos[0];
+    input->data.f[3] = endPos[1];
+
 
     for (int i = 0; i < 3; i++) {
       sensor.setChannel(i);
       sensor.sample();
-      input->data.f[i + 4] = sensor.distanceMillimeters * 10;
+      input->data.f[i + 4] = sensor.distanceMillimeters;
     }
-    for (int i = 0; i < 7; i++) {
-      Serial.println(input->data.f[i]);
+
+    for (int i = 0; i < 8; i++) {
+      DEBUG_PRINTLN(input->data.f[i]);
     }
 
     // Run inference, and report if an error occurs
     TfLiteStatus invoke_status = interpreter->Invoke();
     if (invoke_status != kTfLiteOk) {
-      Serial.println("Invoke failed!");
+      DEBUG_PRINTLN("Invoke failed!");
       return;
     }
-    action_max = 0.0f;
-    u8g2.firstPage();
+    action_max = output->data.f[0];
     for (int i = 0; i < 3; i++) {
-      Serial.println(output->data.f[i]);
-      u8g2.setCursor(0, (i + 1) * 15);
-      switch (i) {
-        case 0:
-          u8g2.print("L: ");
-          break;
-        case 1:
-          u8g2.print("R: ");
-          break;
-        case 2:
-          u8g2.print("M: ");
-          break;
-      }
-      u8g2.setCursor(30, (i + 1) * 15);
-      u8g2.print(output->data.f[i]);
+      DEBUG_PRINTLN(output->data.f[i]);
       if (output->data.f[i] > action_max) {
         action_max = output->data.f[i];
         action = i;
+        DEBUG_PRINTLN(action);
       }
     }
+
+    float randomFloat = random(0, 2147483647) / 2147483647.0f;
+    u8g2.setCursor(0, 20);
+    if (randomFloat < epsilon) {
+      buzzer.play("A32");
+      action = static_cast<int>(random(0, 3));
+    } else {
+      buzzer.play("A32");
+    }
+
     u8g2.setCursor(0, 60);
     switch (action) {
-      case 0:
+      case LEFT:
         Serial.println("Turn Left");
         u8g2.print("Turn Left");
         u8g2.nextPage();
-        turn('l', 1);
+        turn('l');
         break;
-      case 1:
+      case RIGHT:
         Serial.println("Turn Right");
         u8g2.print("Turn Right");
         u8g2.nextPage();
-        turn('r', 1);
+        turn('r');
         break;
-      case 2:
+      case MOVE:
         Serial.println("Move Forward");
         u8g2.print("Move Forward");
         u8g2.nextPage();
-        moveForward(true, 1);
+        if (moveForward()) updateCurrentPos(true);
+        break;
+    }
+
+    if ((currentPos[0] == endPos[0]) && (currentPos[1] == endPos[1])) {
+      driving = !driving;
     }
   }
 }
@@ -278,18 +347,23 @@ void turn(char dir, int count) {
 }
 
 
-void moveForward(bool forward, int count) {
+bool moveForward(bool forward, int count) {
   int speed = defaultSpeed;
-  bool hasSampled = false;
+  int speedLeft = 0;
+  int speedRight = 0;
   int distanceFront = 80;
   int distanceSide = 200;
-  int driveDistance = 18 * count;
+  bool hasSampled = false;
+  float driveDistance = 17.25F * count;
   wallRight = true;
   wallLeft = true;
   sensor.setChannel(1);
-  sensor.sample();
+  sensor.startSample();
+  while (!sensor.isSampleDone()) {}
+  sensor.readOutputRegs();
+
   if (forward && sensor.distanceMillimeters < distanceFront) {
-    return;
+    return false;
   }
 
   for (int i = 0; i < 3; i++) {
@@ -297,66 +371,98 @@ void moveForward(bool forward, int count) {
     sensor.startSample();
   }
 
-  Sr = 0.0F;
+  distanceRight = 0.0F;
   countsRight = encoders.getCountsAndResetRight();
   countsRight = 0;
   prevRight = 0;
 
   while (true) {
+
+    bumpSensors.read();
+    if (bumpSensors.leftIsPressed()) {
+      motors.setSpeeds(-speed, -speed);
+      delay(100);
+      motors.setSpeeds(0, 0);
+      return false;
+    }
+    if (bumpSensors.rightIsPressed()) {
+      motors.setSpeeds(-speed, -speed);
+      delay(100);
+      motors.setSpeeds(0, 0);
+      return false;
+    }
     turnSensorUpdate();
 
     sensor.nextChannel();
     // start sample evaluation shortly after moving to avoid detecting an opening at the start
-    if (sensor.isSampleDone() && Sr > 2) {
+    if (sensor.isSampleDone() && distanceRight >= 2) {
       sensor.readOutputRegs();
+      int distanceMM = sensor.distanceMillimeters;
+      // recognize wall openings during moving
       switch (sensor.channelUsed) {
         case 0:
-          if (wallLeft && sensor.distanceMillimeters > distanceSide) {
+          if (wallLeft && distanceMM > distanceSide) {
             wallLeft = false;
+          }
+          if (distanceMM < 150) {
+            speedLeft = 10;
+          } else {
+            speedLeft = 0;
           }
           break;
         case 1:
-          if (sensor.distanceMillimeters < distanceFront) {
+          if (distanceMM < distanceFront) {
             goto bailout;
           }
           break;
         case 2:
-          if (wallRight && sensor.distanceMillimeters > distanceSide) {
+          if (wallRight && distanceMM > distanceSide) {
             wallRight = false;
+          }
+          if (distanceMM < 150) {
+            speedRight = 10;
+          } else {
+            speedRight = 0;
           }
           break;
       }
       sensor.startSample();
     }
 
-    countsRight += encoders.getCountsAndResetRight();
 
-    Sr += ((countsRight - prevRight) / (CLICKS_PER_ROTATION * GEAR_RATIO) * WHEEL_CIRCUMFERENCE);
+    countsRight += encoders.getCountsAndResetRight();
+    // approximate the driven distance
+    distanceRight += ((countsRight - prevRight) / (CLICKS_PER_ROTATION * GEAR_RATIO) * WHEEL_CIRCUMFERENZCE);
 
     int diff = headingDirection - getCurrentAngle();
     int absDiff = abs(diff);
+    // diff shouldn't be negative; edge case: headingDirection = 0 and angle = 350 should be diff 10 and not 350
     if (absDiff > 100) {
       absDiff = 360 - absDiff;
     }
 
+    // turnSpeed shouldn't be greater than 10 as the robot would start to wiggle
     int turnSpeed = speed * absDiff / 20;
     if (turnSpeed > 10) {
       turnSpeed = 10;
+    } else if (speedLeft != 0 || speedRight != 0) {
+      turnSpeed = 0;
     }
 
-    if (Sr < driveDistance && Sr > -driveDistance) {
-      if (Sr > driveDistance - 5 || Sr < -driveDistance + 5) {
-        speed = defaultSpeed - (abs(Sr) * 3);
+    if (distanceRight <= driveDistance && distanceRight >= -driveDistance) {
+      if (distanceRight > driveDistance - 5 || distanceRight < -driveDistance + 5) {
+        speed = defaultSpeed - (abs(distanceRight) * 3);
       }
       if (speed < 25) {
         speed = 25;
       }
+
       if (diff > 0 || diff < -270) {
-        forward ? motors.setSpeeds(speed, speed + turnSpeed) : motors.setSpeeds(-speed - turnSpeed, -speed);
+        forward ? motors.setSpeeds(speed + speedLeft, speed + speedRight + turnSpeed) : motors.setSpeeds(-speed - turnSpeed, -speed);
       } else if (diff < 0) {
-        forward ? motors.setSpeeds(speed + turnSpeed, speed) : motors.setSpeeds(-speed, -speed - turnSpeed);
+        forward ? motors.setSpeeds(speed + speedLeft + turnSpeed, speed + speedRight) : motors.setSpeeds(-speed, -speed - turnSpeed);
       } else {
-        forward ? motors.setSpeeds(speed, speed) : motors.setSpeeds(-speed, -speed);
+        forward ? motors.setSpeeds(speed + speedLeft, speed + speedRight) : motors.setSpeeds(-speed, -speed);
       }
     } else {
       break;
@@ -367,20 +473,30 @@ void moveForward(bool forward, int count) {
 
 bailout:
   motors.setSpeeds(0, 0);
+  DEBUG_PRINTLN(distanceRight);
+  return distanceRight > 12.0F ? true : false;
+}
+
+void updateCurrentPos(bool movedForward) {
   switch (headingDirection) {
-    case 0:
-      my_y += 0.5;
+    case NORTH:
+      movedForward ? changeCurrentPos(1, 1) : changeCurrentPos(1, -1);
       break;
-    case 90:
-      my_x -= 0.5;
+    case EAST:
+      movedForward ? changeCurrentPos(0, 1) : changeCurrentPos(0, -1);
       break;
-    case 180:
-      my_y -= 0.5;
+    case SOUTH:
+      movedForward ? changeCurrentPos(1, -1) : changeCurrentPos(1, 1);
       break;
-    case 270:
-      my_x += 0.5;
+    case WEST:
+      movedForward ? changeCurrentPos(0, -1) : changeCurrentPos(0, 1);
       break;
   }
+}
+
+void changeCurrentPos(int field, int change) {
+  currentPos[field] = currentPos[field] + change;
+  Serial.println(currentPos[field]);
 }
 
 int32_t getCurrentAngle() {
