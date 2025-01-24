@@ -5,10 +5,11 @@
 #include <SPI.h>
 #include <U8g2lib.h>
 #include <vector>
+#include <limits.h>
 
 U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI u8g2(U8G2_R0, 2, 3, U8X8_PIN_NONE, 0, 1);
 
-#define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
 #define DEBUG_PRINT(x) Serial.print(x)
@@ -48,8 +49,8 @@ long prevRight = 0;
 float distanceRight = 0.0F;
 int headingDirection = 0;
 int defaultSpeed = 80;
-int currentPos[] = { 0, 0 };
-int endPos[] = { 2, 1 };
+float currentPos[] = { 0.5, 0.5 };
+float endPos[] = { 10.5, 4.5 };
 String endProgramm = "";
 
 // method call to be able to define default parameters
@@ -93,6 +94,9 @@ TfLiteTensor* output = nullptr;
 
 int action = 0;
 float action_max = 0.0f;
+int seed = 4;
+
+float epsilon = 0.38;
 
 enum actions {
   LEFT = 0,
@@ -138,7 +142,7 @@ void setup() {
 
   pretty_print_vector(vec);
 
-  randomSeed(5);
+  randomSeed(seed);
 
   turnSensorSetup();
   turnSensorReset();
@@ -231,14 +235,33 @@ void setup() {
 
 void loop() {
   motors.setSpeeds(0, 0);
-  bumpSensors.read();
+  bumpSensors.calibrate();
   if (buttonA.isPressed()) {
     delay(2000);
     driving = !driving;
   }
+  if (buttonC.isPressed()) {
+    seed += 1;
+    u8g2.firstPage();
+    u8g2.setCursor(0, 20);
+    u8g2.print(seed);
+    u8g2.nextPage();
+    DEBUG_PRINTLN(seed);
+    randomSeed(seed);
+    delay(20);
+  }
   if (driving) {
-
-    delay(500);
+    u8g2.firstPage();
+    u8g2.setCursor(0, 40);
+    u8g2.print("x: ");
+    u8g2.print(currentPos[0]);
+    u8g2.print(", ");
+    u8g2.print("y: ");
+    u8g2.print(currentPos[1]);
+    u8g2.nextPage();
+    if (buttonB.isPressed()) {
+      driving = !driving;
+    }
     // fill input tensor of the model
     for (int i = 0; i < vec.size(); i++) {
       for (int j = 0; j < 2; j++) {
@@ -260,7 +283,7 @@ void loop() {
     }
 
     action_max = output->data.f[0];
-    u8g2.firstPage();
+    u8g2.setCursor(0, 20);
     for (int i = 0; i < 4; i++) {
       DEBUG_PRINTLN(output->data.f[i]);
       if (output->data.f[i] > action_max) {
@@ -268,6 +291,14 @@ void loop() {
         action = i;
         DEBUG_PRINTLN(action);
       }
+    }
+    float randomFloat = random(0, 2147483647) / 2147483647.0f;
+
+    if (randomFloat < epsilon) {
+      buzzer.play("A32");
+      action = static_cast<int>(random(0, 4));
+    } else {
+      buzzer.play("A32");
     }
     u8g2.setCursor(0, 60);
     switch (action) {
@@ -299,6 +330,9 @@ void loop() {
     vec.erase(vec.begin());
     std::tuple<float, float> new_pos(currentPos[0], currentPos[1]);
     vec.push_back(new_pos);
+    if ((currentPos[0] == endPos[0]) && (currentPos[1] == endPos[1])) {
+      driving = !driving;
+    }
   }
 }
 
@@ -467,6 +501,20 @@ bool moveForward(bool forward, int count) {
   prevRight = 0;
 
   while (true) {
+
+    bumpSensors.read();
+    if (bumpSensors.leftIsPressed()) {
+      motors.setSpeeds(-speed, -speed);
+      delay(100);
+      motors.setSpeeds(0, 0);
+      return false;
+    }
+    if (bumpSensors.rightIsPressed()) {
+      motors.setSpeeds(-speed, -speed);
+      delay(100);
+      motors.setSpeeds(0, 0);
+      return false;
+    }
     turnSensorUpdate();
 
     sensor.nextChannel();
@@ -555,17 +603,17 @@ bailout:
 
 void updateCurrentPos(bool movedForward) {
   switch (headingDirection) {
-    case 0:
-      movedForward ? changeCurrentPos(0, 1) : changeCurrentPos(0, -1);
-      break;
-    case 90:
+    case NORTH:
       movedForward ? changeCurrentPos(1, 1) : changeCurrentPos(1, -1);
       break;
-    case 180:
-      movedForward ? changeCurrentPos(0, -1) : changeCurrentPos(0, 1);
+    case EAST:
+      movedForward ? changeCurrentPos(0, 1) : changeCurrentPos(0, -1);
       break;
-    case 270:
+    case SOUTH:
       movedForward ? changeCurrentPos(1, -1) : changeCurrentPos(1, 1);
+      break;
+    case WEST:
+      movedForward ? changeCurrentPos(0, -1) : changeCurrentPos(0, 1);
       break;
   }
 }
